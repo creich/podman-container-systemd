@@ -1,6 +1,7 @@
 ---
 
 - name: check if service file exists already
+  become: true
   stat:
     path: "{{ service_files_dir }}/{{ service_name }}"
   register: service_file_before_template
@@ -9,102 +10,113 @@
   block:
 
   - name: ensure podman is installed
+    become: true
     package:
       name: podman
       state: installed
     when: not skip_podman_install
 
-  - name: running single container, get image Id if it exists
-    # command: podman inspect -f {{.Id}} "{{ container_image }}"
-    command: "podman image inspect -f '{{ '{{' }}.Id{{ '}}' }}' {{ container_image }}"
-    register: pre_pull_id
-    ignore_errors: yes
-    when: container_image is defined
+  - name: tasks to run as "{{ container_run_as_user }}"
+    become: true
+    become_user: "{{ container_run_as_user }}"
+    block:
 
-  - name: running single container, ensure we have up to date container image
-    command: "podman pull {{ container_image }}"
-    when: container_image is defined
+       - name: running single container, get image Id if it exists
+         # command: podman inspect -f {{.Id}} "{{ container_image }}"
+         command: "podman image inspect -f '{{ '{{' }}.Id{{ '}}' }}' {{ container_image }}"
+         register: pre_pull_id
+         ignore_errors: yes
+         when: container_image is defined
 
-  - name: running single container, get image Id if it exists
-    command: "podman image inspect -f '{{ '{{' }}.Id{{ '}}' }}'  {{ container_image }}"
-    register: post_pull_id
-    when: container_image is defined
+       - name: running single container, ensure we have up to date container image
+         command: "podman pull {{ container_image }}"
+         when: container_image is defined
 
-  - name: force restart after image change
-    debug: msg="image has changed"
-    changed_when: True
-    notify: restart service
-    when:
-      - container_image is defined
-      - pre_pull_id.stdout != post_pull_id.stdout
-      - pre_pull_id is succeeded
+       - name: running single container, get image Id if it exists
+         command: "podman image inspect -f '{{ '{{' }}.Id{{ '}}' }}'  {{ container_image }}"
+         register: post_pull_id
+         when: container_image is defined
 
-  # XXX remove above comparison if future podman tells image changed.
+       - name: force restart after image change
+         debug: msg="image has changed"
+         changed_when: True
+         notify: restart service
+         when:
+            - container_image is defined
+            - pre_pull_id.stdout != post_pull_id.stdout
+            - pre_pull_id is succeeded
 
-  - name: seems we use several container images, ensure all are up to date
-    command: "podman pull {{ item }}"
-    when: container_image_list is defined
-    with_items: "{{ container_image_list }}"
+       # XXX remove above comparison if future podman tells image changed.
 
-  - name: if running pod, ensure configuration file exists
-    stat:
-      path: "{{ container_pod_yaml }}"
-    register: pod_file
-    when: container_pod_yaml is defined
-  - name: fail if pod configuration file is missing
-    fail:
-      msg: "Error: Asking to run pod, but pod definition yaml file is missing: {{ container_pod_yaml }}"
-    when:
-      - container_pod_yaml is defined
-      - not pod_file.stat.exists
+       - name: seems we use several container images, ensure all are up to date
+         command: "podman pull {{ item }}"
+         when: container_image_list is defined
+         with_items: "{{ container_image_list }}"
 
-  - name: "create systemd service file for container: {{ container_name }}"
-    template:
-      src: systemd-service-single.j2
-      dest: "{{ service_files_dir }}/{{ service_name }}"
-      owner: root
-      group: root
-      mode: 0644
-    notify: reload systemctl
-    register: service_file
-    when: container_image is defined
+       - name: if running pod, ensure configuration file exists
+         stat:
+            path: "{{ container_pod_yaml }}"
+         register: pod_file
+         when: container_pod_yaml is defined
+       - name: fail if pod configuration file is missing
+         fail:
+            msg: "Error: Asking to run pod, but pod definition yaml file is missing: {{ container_pod_yaml }}"
+         when:
+            - container_pod_yaml is defined
+            - not pod_file.stat.exists
 
-  - name: "create systemd service file for pod: {{ container_name }}"
-    template:
-      src: systemd-service-pod.j2
-      dest: "{{ service_files_dir }}/{{ service_name }}"
-      owner: root
-      group: root
-      mode: 0644
-    notify:
-      - reload systemctl
-      - start service
-    register: service_file
-    when: container_image_list is defined
+  - name: system tasks requiring super user power
+    become: true
+    block:
 
-  - name: ensure "{{ service_name }}" is enabled at boot, and systemd reloaded
-    systemd:
-      name: "{{ service_name }}"
-      enabled: yes
-      daemon_reload: yes
+       - name: "create systemd service file for container: {{ container_name }}"
+         template:
+            src: systemd-service-single.j2
+            dest: "{{ service_files_dir }}/{{ service_name }}"
+            owner: root
+            group: root
+            mode: 0644
+         notify: reload systemctl
+         register: service_file
+         when: container_image is defined
 
-  - name: ensure "{{ service_name }}" is running
-    service:
-      name: "{{ service_name }}"
-      state: started
-    when: not service_file_before_template.stat.exists
+       - name: "create systemd service file for pod: {{ container_name }}"
+         template:
+            src: systemd-service-pod.j2
+            dest: "{{ service_files_dir }}/{{ service_name }}"
+            owner: root
+            group: root
+            mode: 0644
+         notify:
+            - reload systemctl
+            - start service
+         register: service_file
+         when: container_image_list is defined
 
-  - name: "ensure {{ service_name }} is restarted due config change"
-    debug: msg="config has changed:"
-    changed_when: True
-    notify: restart service
-    when:
-      - service_file_before_template.stat.exists
-      - service_file.changed
+       - name: ensure "{{ service_name }}" is enabled at boot, and systemd reloaded
+         systemd:
+            name: "{{ service_name }}"
+            enabled: yes
+            daemon_reload: yes
+
+       - name: ensure "{{ service_name }}" is running
+         service:
+            name: "{{ service_name }}"
+            state: started
+         when: not service_file_before_template.stat.exists
+
+       - name: "ensure {{ service_name }} is restarted due config change"
+         debug: msg="config has changed:"
+         changed_when: True
+         notify: restart service
+         when:
+            - service_file_before_template.stat.exists
+            - service_file.changed
 
   when: container_state == "running"
 
 - name: configure firewall if container_firewall_ports is defined
+  become: true
   block:
 
   - name: set firewall ports state to enabled when container state is running
@@ -138,6 +150,7 @@
 
 
 - name: do cleanup stuff when container_state is "absent"
+  become: true
   block:
 
   - name: ensure "{{ service_name }}" is disabled at boot
